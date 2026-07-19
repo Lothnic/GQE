@@ -18,6 +18,50 @@ GQE integrates Mixture-of-Experts (MoE) routing directly into Grouped-Query Atte
 
 ---
 
+## Empirical Comparison: GQE vs GQA (25M Model Scale)
+
+Both GQE and GQA were trained under identical pretraining budgets (300M tokens on FineWeb-Edu) and evaluated on quality and prefill latency.
+
+### 1. Zero-Shot Downstream Accuracy (100 validation samples)
+| Task | GQE Accuracy (%) | GQA Baseline Accuracy (%) | GQE Score Count | GQA Score Count |
+| :--- | :---: | :---: | :---: | :---: |
+| **PIQA** | 53.00% | 58.00% | 53 / 100 | 58 / 100 |
+| **ARC-Easy** | 27.00% | 27.00% | 27 / 100 | 27 / 100 |
+| **HellaSwag** | 34.00% | 31.00% | 34 / 100 | 31 / 100 |
+| **Average** | **38.00%** | **38.67%** | — | — |
+
+*GQE retains competitive downstream performance compared to the fully-dense GQA baseline (within 0.67% average accuracy) while saving active query-head compute.*
+
+---
+
+### 2. Prefill Latency (25M config, 16K sequence length)
+
+Measured on RTX 4060 Mobile (8 GB). GQE uses dense Q projection with `torch.gather` index selection (not per-expert weight-row gather), and the shared head is fused into a single `F.scaled_dot_product_attention` call alongside the routed heads.
+
+| Precision | GQA (ms) | GQE (ms) | Speedup |
+| :---: | :---: | :---: | :---: |
+| fp32 | — | — | **1.12x** |
+| bf16 | — | — | **1.16x** |
+
+*Earlier passes using per-expert weight-row gathering and a separate SDPA call for the shared head were substantially slower (~0.4x at 16K). Switching to a dense Q projection with index gather on the result, and fusing the shared head into the routed heads' SDPA call, recovered positive speedup.*
+
+---
+
+### 3. Gap vs Paper Claim
+
+The paper reports **1.7–1.8× prefill speedup** at long context lengths (Figure 1). Our best results on the 25M-parameter scale config reach ~1.16× at 16K with bf16, which is still short of that target.
+
+**Likely factors for the gap:**
+
+| Factor | Impact |
+|--------|--------|
+| **Model scale** | Paper reports at 250M params (32 layers, d_model=1024). Our 25M config (6 layers, d_model=512) has far lower attention FLOPs, so routing overhead is a larger fraction of total time. At 250M, the crossover should occur at shorter sequence lengths. |
+| **Kernel efficiency** | The paper likely uses custom fused CUDA kernels for sparse expert dispatch, whereas we use stock PyTorch `torch.gather` + `F.scaled_dot_product_attention`. A fused kernel that skips the full Q projection entirely (projecting only selected expert rows) would reduce both compute and memory traffic. |
+| **Router overhead** | The router is a full `(B, S, d_model) × (d_model, G*M)` matmul per layer. This is O(d_model²) FLOPs per token — non-trivial at small scales. Fusing the router into the Q projection or using a cheaper router might help. |
+| **Output projection** | GQE's W_O projects (kG+2) = 10 slots vs GQA's 16. This is already smaller, but the paper accounts for this — it's a genuine saving at any scale. |
+
+---
+
 ## Code Structure
 
 ```
@@ -121,54 +165,3 @@ Run text generation from a custom prompt (falls back to random weights if no che
 PYTHONPATH=. python3 src/inference.py --config configs/25m_config.yaml --prompt "Deep learning is" --max_tokens 30
 ```
 
----
-
-## Empirical Comparison: GQE vs GQA (25M Model Scale)
-
-Both GQE and GQA were trained under identical pretraining budgets (300M tokens on FineWeb-Edu) and evaluated on quality and prefill latency.
-
-### 1. Zero-Shot Downstream Accuracy (100 validation samples)
-| Task | GQE Accuracy (%) | GQA Baseline Accuracy (%) | GQE Score Count | GQA Score Count |
-| :--- | :---: | :---: | :---: | :---: |
-| **PIQA** | 53.00% | 58.00% | 53 / 100 | 58 / 100 |
-| **ARC-Easy** | 27.00% | 27.00% | 27 / 100 | 27 / 100 |
-| **HellaSwag** | 34.00% | 31.00% | 34 / 100 | 31 / 100 |
-| **Average** | **38.00%** | **38.67%** | — | — |
-
-*GQE retains competitive downstream performance compared to the fully-dense GQA baseline (within 0.67% average accuracy) while saving active query-head compute.*
-
----
-
-### 2. Prefill Latency (25M config, 16K sequence length)
-
-Measured on RTX 4060 Mobile (8 GB). GQE uses dense Q projection with `torch.gather` index selection (not per-expert weight-row gather), and the shared head is fused into a single `F.scaled_dot_product_attention` call alongside the routed heads.
-
-| Precision | GQA (ms) | GQE (ms) | Speedup |
-| :---: | :---: | :---: | :---: |
-| fp32 | — | — | **1.12x** |
-| bf16 | — | — | **1.16x** |
-
-*Earlier passes using per-expert weight-row gathering and a separate SDPA call for the shared head were substantially slower (~0.4x at 16K). Switching to a dense Q projection with index gather on the result, and fusing the shared head into the routed heads' SDPA call, recovered positive speedup.*
-
----
-
-### 3. Gap vs Paper Claim
-
-The paper reports **1.7–1.8× prefill speedup** at long context lengths (Figure 1). Our best results on the 25M-parameter scale config reach ~1.16× at 16K with bf16, which is still short of that target.
-
-**Likely factors for the gap:**
-
-| Factor | Impact |
-|--------|--------|
-| **Model scale** | Paper reports at 250M params (32 layers, d_model=1024). Our 25M config (6 layers, d_model=512) has far lower attention FLOPs, so routing overhead is a larger fraction of total time. At 250M, the crossover should occur at shorter sequence lengths. |
-| **Kernel efficiency** | The paper likely uses custom fused CUDA kernels for sparse expert dispatch, whereas we use stock PyTorch `torch.gather` + `F.scaled_dot_product_attention`. A fused kernel that skips the full Q projection entirely (projecting only selected expert rows) would reduce both compute and memory traffic. |
-| **Router overhead** | The router is a full `(B, S, d_model) × (d_model, G*M)` matmul per layer. This is O(d_model²) FLOPs per token — non-trivial at small scales. Fusing the router into the Q projection or using a cheaper router might help. |
-| **Output projection** | GQE's W_O projects (kG+2) = 10 slots vs GQA's 16. This is already smaller, but the paper accounts for this — it's a genuine saving at any scale. |
-
-**To the paper authors** — we'd genuinely like to understand what we're missing at the kernel level to reach the reported 1.7–1.8×. Our implementation uses:
-- Dense Q projection (`nn.Linear` for all N experts + shared head) then `torch.gather` to select routed heads
-- Fused single `F.scaled_dot_product_attention` call for selected + shared heads
-- Renormalized weighted-sum slot (no extra attention)
-- W_O with (kG+2) input slots
-
-Is the remaining gap primarily from custom fused kernels (e.g., skipping the full Q projection and computing only selected expert Q rows), from the model scale difference (25M vs 250M), from Flash Attention dispatch overheads, or something else?
