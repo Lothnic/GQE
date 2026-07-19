@@ -1,0 +1,9 @@
+paper.md
+paper.pdf
+venv/
+__pycache__/
+.pytest_cache/
+.benchmarks/
+checkpoints/
+logs/
+*.pt

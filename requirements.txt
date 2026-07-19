@@ -1,0 +1,12 @@
+torch>=2.0.0
+transformers>=4.30.0
+datasets>=2.12.0
+pyyaml
+pytest
+numpy
+pandas
+matplotlib
+tqdm
+fsspec>=2023.5.0
+huggingface_hub
+lm-eval>=0.4.0

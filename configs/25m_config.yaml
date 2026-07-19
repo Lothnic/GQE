@@ -1,0 +1,38 @@
+# 25m_config.yaml — 25M parameter model / 3B token scaled down configuration
+# Used for rapid training, verification, and local development.
+
+model:
+  d_model: 512               # Scaled down hidden size
+  n_layers: 6                # Scaled down depth
+  n_query_heads: 8           # 8 query heads
+  n_kv_heads: 4              # 4 KV heads (G = 4 groups, M = 2 experts/group)
+  d_head: 64                 # Keep head size 64 to preserve attention properties
+  d_ff: 2048                 # 4x scaling
+  vocab_size: 32000          # Scaled vocab size to reduce embedding parameter footprint
+  max_seq_len: 2048          # Keep 2048 sequence length
+
+gqe:
+  top_k: 1                   # k=1 active expert per group
+  variant: full              # Table 2: full | hard_only | weighted_no_renorm
+  shared_kv_policy: group_0  # group_0 | dedicated | mean
+  aux_loss_coeff: 0.01       # auxiliary loss coefficient
+
+training:
+  optimizer: adamw
+  beta1: 0.9
+  beta2: 0.95
+  epsilon: 1.0e-7
+  lr_schedule: wsd
+  max_lr: 5.0e-4
+  warmup_tokens: 30_000_000 # 10% of 300M tokens
+  weight_decay: 0.1
+  total_tokens: 300_000_000 # 300M tokens budget for cheap pretraining
+  global_batch_tokens: 524_288 # Scaled down global batch size for smaller model
+  device_batch_size: 8        # Safe batch size on L4 (24GB VRAM) to prevent logits allocation OOM
+  precision: bf16
+  use_zclip: true
+  gradient_checkpointing: true
+
+data:
+  dataset: "HuggingFaceFW/fineweb-edu"
+  streaming: true

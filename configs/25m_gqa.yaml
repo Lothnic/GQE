@@ -1,0 +1,40 @@
+# 25m_gqa.yaml — 25M GQA baseline configuration
+# Used to train and evaluate a dense GQA baseline for comparison with GQE.
+
+model:
+  type: gqa                  # Initialize as dense Grouped-Query Attention (baseline)
+  d_model: 512               # Same hidden size
+  n_layers: 6                # Same depth
+  n_query_heads: 8           # Same 8 query heads
+  n_kv_heads: 4              # Same 4 KV heads (G = 4 groups)
+  d_head: 64                 # Same head size
+  d_ff: 2048                 # Same MLP scale
+  vocab_size: 32000          # Same vocabulary footprint
+  max_seq_len: 2048          # Same sequence length
+
+gqe:
+  top_k: 1                   # (Ignored by GQA, but kept for schema compatibility)
+  variant: full              
+  shared_kv_policy: group_0  
+  use_sparse_q: null         
+  aux_loss_coeff: 0.01       # Used for initialization in train.py
+
+training:
+  optimizer: adamw
+  beta1: 0.9
+  beta2: 0.95
+  epsilon: 1.0e-7
+  lr_schedule: wsd
+  max_lr: 5.0e-4
+  warmup_tokens: 30_000_000 
+  weight_decay: 0.1
+  total_tokens: 300_000_000 # Same pretraining token budget (300M tokens)
+  global_batch_tokens: 524_288 
+  device_batch_size: 8        
+  precision: bf16
+  use_zclip: true
+  gradient_checkpointing: true
+
+data:
+  dataset: "HuggingFaceFW/fineweb-edu"
+  streaming: true
