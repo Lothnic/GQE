@@ -49,7 +49,7 @@ Measured on RTX 4060 Mobile (8 GB). GQE uses dense Q projection with `torch.gath
 
 ### 3. Gap vs Paper Claim
 
-The paper reports **1.7–1.8× prefill speedup** at long context lengths (Figure 1). Our best results on the 25M-parameter scale config reach ~1.16× at 16K with bf16, which is still short of that target.
+The paper reports **1.7–1.8× prefill speedup** at long context lengths (Figure 1). My best results on the 25M-parameter scale config reach ~1.16× at 16K with bf16, which is still short of that target which might be due to the smaller model size.
 
 **Likely factors for the gap:**
 
