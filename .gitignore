@@ -1,5 +1,6 @@
 paper.md
 paper.pdf
+PAPER_UNDERSTANDING_AND_VERIFICATION.md
 venv/
 __pycache__/
 .pytest_cache/
