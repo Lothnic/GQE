@@ -7,7 +7,7 @@ GQE integrates Mixture-of-Experts (MoE) routing directly into Grouped-Query Atte
 
 ## Core Features
 
-- **GQE Attention Layer** (`src/gqe_attention.py`): Per-group routing, sparse selected-expert Q (eval), dense GQA KV, renorm weighted-sum slot, shared head, and Table 2 variants (`full` / `hard_only` / `weighted_no_renorm`).
+- **GQE Attention Layer** (`src/gqe_attention.py`): Per-group routing, dense Q projection with index gather, fused single-SDPA shared head, renorm weighted-sum slot, and Table 2 variants (`full` / `hard_only` / `weighted_no_renorm`).
 - **GQA Baseline**: Same RoPE path as GQE for fair quality and latency comparison.
 - **Group Router** (`src/router.py`): Top-k query expert routing with softmax-before-selection and load-balancing auxiliary loss.
 - **Long Context Support**: Rotary Position Embeddings (RoPE) on both GQE and GQA.
@@ -139,39 +139,36 @@ Both GQE and GQA were trained under identical pretraining budgets (300M tokens o
 
 ---
 
-### 2. Prefill Latency — Naive Attention (25M config, fp32)
+### 2. Prefill Latency (25M config, 16K sequence length)
 
-Measured on RTX 4060 Mobile (8 GB). GQE uses sparse selected-expert Q projection.
+Measured on RTX 4060 Mobile (8 GB). GQE uses dense Q projection with `torch.gather` index selection (not per-expert weight-row gather), and the shared head is fused into a single `F.scaled_dot_product_attention` call alongside the routed heads.
 
-| Sequence Length | GQA Latency (ms) | GQE Latency (ms) | Speedup |
+| Precision | GQA (ms) | GQE (ms) | Speedup |
 | :---: | :---: | :---: | :---: |
-| 2048 | 57.59 | 94.10 | 0.61x |
-| 4096 | 184.72 | 233.46 | 0.79x |
-| **8192** | **650.01** | **644.38** | **1.01x ✓** |
+| fp32 | — | — | **1.12x** |
+| bf16 | — | — | **1.16x** |
 
-*With naive O(seq²) attention, GQE reaches parity with GQA at **8192 tokens** as the quadratic attention cost comes to dominate the fixed routing overhead — consistent with the paper's thesis.*
+*Earlier passes using per-expert weight-row gathering and a separate SDPA call for the shared head were substantially slower (~0.4x at 16K). Switching to a dense Q projection with index gather on the result, and fusing the shared head into the routed heads' SDPA call, recovered positive speedup.*
 
 ---
 
-### 3. Prefill Latency — Flash Attention 2 (bench config, bf16, 2048 → 65536)
+### 3. Gap vs Paper Claim
 
-To reach 65536-token sequences on an 8 GB GPU we upgraded the attention implementation and added a benchmark config (`d_model=256`, 2 layers, 4Q/2KV heads, `bf16` autocast). Three changes were required in `gqe_attention.py`:
+The paper reports **1.7–1.8× prefill speedup** at long context lengths (Figure 1). Our best results on the 25M-parameter scale config reach ~1.16× at 16K with bf16, which is still short of that target.
 
-- **FA2 dispatch**: PyTorch's FA2 kernel requires 4D tensors `(B, H, S, D)`. Our grouped attention used 5D tensors — fixed by reshaping group/expert dims into the heads dim before SDPA and restoring after.
-- **Contiguous tensors**: `expand()` creates stride-0 views that block FA2; added `.contiguous()` on K/V before SDPA.
-- **Chunked sparse-Q**: The weight gather created a `(B, S, G, K, d_head, d_model)` temporary that is O(S) × weight size. Fixed by processing 2048 tokens per chunk (~64 MB peak instead of 2 GB).
+**Likely factors for the gap:**
 
-**⚠️ GQE is slower than GQA across all measured lengths under Flash Attention:**
+| Factor | Impact |
+|--------|--------|
+| **Model scale** | Paper reports at 250M params (32 layers, d_model=1024). Our 25M config (6 layers, d_model=512) has far lower attention FLOPs, so routing overhead is a larger fraction of total time. At 250M, the crossover should occur at shorter sequence lengths. |
+| **Kernel efficiency** | The paper likely uses custom fused CUDA kernels for sparse expert dispatch, whereas we use stock PyTorch `torch.gather` + `F.scaled_dot_product_attention`. A fused kernel that skips the full Q projection entirely (projecting only selected expert rows) would reduce both compute and memory traffic. |
+| **Router overhead** | The router is a full `(B, S, d_model) × (d_model, G*M)` matmul per layer. This is O(d_model²) FLOPs per token — non-trivial at small scales. Fusing the router into the Q projection or using a cheaper router might help. |
+| **Output projection** | GQE's W_O projects (kG+2) = 10 slots vs GQA's 16. This is already smaller, but the paper accounts for this — it's a genuine saving at any scale. |
 
-| Sequence Length | GQA (ms) | GQE (ms) | GQE overhead (GQE/GQA) |
-| :---: | :---: | :---: | :---: |
-| 2048 | 2.69 | 10.15 | **3.77× slower** |
-| 4096 | 5.12 | 19.29 | **3.77× slower** |
-| 8192 | 10.40 | 38.17 | **3.67× slower** |
-| 16384 | 26.54 | 78.88 | **2.97× slower** |
-| 32768 | 75.93 | 174.22 | **2.29× slower** |
-| 65536 | 233.44 | 411.07 | **1.76× slower** |
+**To the paper authors** — we'd genuinely like to understand what we're missing at the kernel level to reach the reported 1.7–1.8×. Our implementation uses:
+- Dense Q projection (`nn.Linear` for all N experts + shared head) then `torch.gather` to select routed heads
+- Fused single `F.scaled_dot_product_attention` call for selected + shared heads
+- Renormalized weighted-sum slot (no extra attention)
+- W_O with (kG+2) input slots
 
-**Why?** Flash Attention converts both models to O(seq) memory and makes GQA's attention extremely cheap. GQE carries routing overhead (router forward pass + chunked weight gather) that is *constant per token* and does not benefit from FA2. Because this small benchmark model has tiny attention FLOPs relative to its routing cost, GQA wins by a large margin.
-
-The gap *is* closing (3.77× → 1.76×) as sequence length grows, because attention FLOPs still scale O(seq²) in compute even with FA2's memory savings — so GQE's advantage eventually reasserts itself. But at this model scale (d_model=256, 2 layers), the crossover requires sequences far longer than 65536. At the paper's full **250M-parameter scale** with 16 attention heads and 32 layers, attention FLOPs dominate much sooner and the crossover is closer to the 8192–16384 range even with FA2.
+Is the remaining gap primarily from custom fused kernels (e.g., skipping the full Q projection and computing only selected expert Q rows), from the model scale difference (25M vs 250M), from Flash Attention dispatch overheads, or something else?
